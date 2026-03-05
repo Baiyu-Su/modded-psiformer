@@ -14,7 +14,7 @@
 
 """Utilities for pretraining and importing PySCF models."""
 
-from typing import Callable, Mapping, Sequence, Tuple
+from typing import Callable, Sequence, Tuple
 
 from absl import logging
 import chex
@@ -34,8 +34,6 @@ import pyscf
 def get_hf(molecule: Sequence[system.Atom] | None = None,
            nspins: Tuple[int, int] | None = None,
            basis: str | None = 'sto-3g',
-           ecp: Mapping[str, str] | None = None,
-           core_electrons: Mapping[str, int] | None = None,
            pyscf_mol: pyscf.gto.Mole | None = None,
            restricted: bool | None = False) -> scf.Scf:
   """Returns an Scf object with the Hartree-Fock solution to the system.
@@ -44,9 +42,6 @@ def get_hf(molecule: Sequence[system.Atom] | None = None,
     molecule: the molecule in internal format.
     nspins: tuple with number of spin up and spin down electrons.
     basis: basis set to use in Hartree-Fock calculation.
-    ecp: dictionary of the ECP to use for different atoms.
-    core_electrons: dictionary of the number of core electrons excluded by the
-      pseudopotential/effective core potential.
     pyscf_mol: pyscf Mole object defining the molecule. If supplied,
       molecule, nspins and basis are ignored.
     restricted: If true, perform a restricted Hartree-Fock calculation,
@@ -59,8 +54,6 @@ def get_hf(molecule: Sequence[system.Atom] | None = None,
     scf_approx = scf.Scf(molecule,
                          nelectrons=nspins,
                          basis=basis,
-                         ecp=ecp,
-                         core_electrons=core_electrons,
                          restricted=restricted)
   scf_approx.run()
   return scf_approx

@@ -152,6 +152,7 @@ def mh_update(
     lp_1,
     num_accepts,
     stddev=0.02,
+    ndim=3,
     blocks=1,
     i=0,
 ):
@@ -182,7 +183,7 @@ def mh_update(
       lp: log probability of f evaluated at x.
       num_accepts: update running total of number of accepted MH moves.
   """
-  del i, blocks  # electron index ignored for all-electron moves
+  del i, blocks, ndim  # electron index ignored for all-electron moves
   key, subkey = jax.random.split(key)
   x1 = data.positions
   x2 = x1 + stddev * jax.random.normal(subkey, shape=x1.shape)  # proposal
@@ -190,6 +191,66 @@ def mh_update(
       params, x2, data.spins, data.atoms, data.charges
   )  # log prob of proposal
   ratio = lp_2 - lp_1
+  x_new, key, lp_new, num_accepts = mh_accept(
+      x1, x2, lp_1, lp_2, ratio, key, num_accepts)
+  new_data = networks.FermiNetData(**(dict(data) | {'positions': x_new}))
+  return new_data, key, lp_new, num_accepts
+
+
+def mh_block_update(
+    params: networks.ParamTree,
+    f: networks.LogFermiNetLike,
+    data: networks.FermiNetData,
+    key: chex.PRNGKey,
+    lp_1,
+    num_accepts,
+    stddev=0.02,
+    ndim=3,
+    blocks=1,
+    i=0,
+):
+  """Performs one Metropolis-Hastings step for a block of electrons.
+
+  Args:
+    params: Wavefuncttion parameters.
+    f: Callable with LogFermiNetLike signature which returns the log of the
+      wavefunction (i.e. the sqaure root of the log probability of x).
+    data: Initial MCMC configuration (batched).
+    key: RNG state.
+    lp_1: log probability of f evaluated at x1 given parameters params.
+    num_accepts: Number of MH move proposals accepted.
+    stddev: width of Gaussian move proposal.
+    ndim: dimensionality of system.
+    blocks: number of blocks to split electron updates into.
+    i: index of block of electrons to move.
+
+  Returns:
+    (x, key, lp, num_accepts), where:
+      x: MCMC configurations with updated positions.
+      key: RNG state.
+      lp: log probability of f evaluated at x.
+      num_accepts: update running total of number of accepted MH moves.
+  """
+  key, subkey = jax.random.split(key)
+  batch_size = data.positions.shape[0]
+  nelec = data.positions.shape[1] // ndim
+  pad = (blocks - nelec % blocks) % blocks
+  x1 = jnp.reshape(
+      jnp.pad(data.positions, ((0, 0), (0, pad * ndim))),
+      [batch_size, blocks, -1, ndim],
+  )
+  ii = i % blocks
+  x2 = x1.at[:, ii].add(
+      stddev * jax.random.normal(subkey, shape=x1[:, ii].shape))
+  x2 = jnp.reshape(x2, [batch_size, -1])
+  if pad > 0:
+    x2 = x2[..., :-pad*ndim]
+  lp_2 = 2.0 * f(params, x2, data.spins, data.atoms, data.charges)
+  ratio = lp_2 - lp_1
+
+  x1 = jnp.reshape(x1, [batch_size, -1])
+  if pad > 0:
+    x1 = x1[..., :-pad*ndim]
   x_new, key, lp_new, num_accepts = mh_accept(
       x1, x2, lp_1, lp_2, ratio, key, num_accepts)
   new_data = networks.FermiNetData(**(dict(data) | {'positions': x_new}))
@@ -204,6 +265,7 @@ def mala_update(
     lp_1,
     num_accepts,
     stddev=0.02,
+    ndim=3,
     blocks=1,
     i=0,
 ):
@@ -233,7 +295,6 @@ def mala_update(
   del i, blocks  # all-electron proposal only
   key, subkey = jax.random.split(key)
   x1 = data.positions
-  ndim = 3
 
   # Define per-sample log-probability (2.0 * f) for forward-mode score.
   # Each sample uses its own spins/atoms/charges.
@@ -305,6 +366,7 @@ def mala_sign_update(
     lp_1,
     num_accepts,
     stddev=0.02,
+    ndim=3,
     blocks=1,
     i=0,
 ):
@@ -315,7 +377,6 @@ def mala_sign_update(
   del i, blocks  # all-electron proposal only
   key, subkey = jax.random.split(key)
   x1 = data.positions
-  ndim = 3
 
   def logprob_single(x_flat, spins_i, atoms_i, charges_i):
     return 2.0 * f(
@@ -413,7 +474,7 @@ def make_mcmc_step(batch_network,
       raise NotImplementedError('MALA (sign) not implemented for block updates; use blocks==1')
     inner_fun = mala_sign_update
   else:
-    inner_fun = mh_update
+    inner_fun = mh_block_update if blocks > 1 else mh_update
 
   def mcmc_step(params, data, key, width):
     """Performs a set of MCMC steps.
@@ -436,6 +497,7 @@ def make_mcmc_step(batch_network,
           batch_network,
           *x,
           stddev=width,
+          ndim=ndim,
           blocks=blocks,
           i=i)
 

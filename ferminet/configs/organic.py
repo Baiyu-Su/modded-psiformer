@@ -25,16 +25,6 @@ from ferminet import base_config
 from ferminet.utils import system
 
 systems = {
-    'bicbut': [['C', (1.0487346562, 0.5208579773, 0.2375867187)],
-               ['C', (0.2497284256, -0.7666691493, 0.0936474818)],
-               ['C', (-0.1817326465, 0.4922777820, -0.6579637266)],
-               ['C', (-1.1430708301, -0.1901383337, 0.3048494250)],
-               ['H', (2.0107137141, 0.5520589541, -0.2623459977)],
-               ['H', (1.0071921280, 1.0672669240, 1.1766131856)],
-               ['H', (0.5438033167, -1.7129829738, -0.3260782874)],
-               ['H', (-0.2580605320, 0.6268443026, -1.7229636111)],
-               ['H', (-1.3778676954, 0.2935640723, 1.2498189977)],
-               ['H', (-1.9664163102, -0.7380906148, -0.1402911727)]],
     'con_TS': [['C', (1.0422528085, 0.5189448459, 0.2893513723)],
                ['C', (0.6334392052, -0.8563584473, -0.1382423606)],
                ['C', (-0.2492035181, 0.3134656784, -0.5658962512)],
@@ -107,6 +97,11 @@ systems = {
 def organic_molecule(cfg):
   """Sets molecule and electrons fields in ConfigDict."""
   cfg.system.electrons = (15, 15)
+  if cfg.system.molecule_name == 'bicbut':
+    raise ValueError(
+        'bicbut has moved to ferminet/configs/bicbut.py. '
+        'Use --config ferminet/configs/bicbut.py instead.'
+    )
   units = 'angstrom'
   if 'cycbut' in cfg.system.molecule_name:
     cfg.system.electrons = (14, 14)

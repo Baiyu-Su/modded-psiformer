@@ -75,12 +75,14 @@ def default() -> ml_collections.ConfigDict:
           'reset_if_nan': False,
           # KFAC hyperparameters. See KFAC documentation for details.
           'kfac': {
-              'invert_every': 10,
+              'invert_every': 1,
               'cov_update_every': 1,
               'damping': 0.001,
-              'cov_ema_decay': 0.999,
+              'cov_ema_decay': 0.95,
               'momentum': 0.0,
               'nesterov': False,
+              # Number of steps for linear warmup of momentum from 0 to final value
+              'momentum_warmup_steps': 20000,
               # Warning: adaptive damping is not currently available.
               'min_damping': 1.0e-4,
               # This is to control g^Tg (without square root)
@@ -101,7 +103,7 @@ def default() -> ml_collections.ConfigDict:
       },
       'log': {
           'stats_frequency': 100,  # iterations between logging of stats
-          'save_frequency': 100.0,  # minutes between saving network params
+          'save_frequency': 240.0,  # minutes between saving network params
           # Path to save/restore network to/from. If falsy,
           # creates a timestamped directory in the working directory.
           'save_path': '',
@@ -131,9 +133,9 @@ def default() -> ml_collections.ConfigDict:
       },
       'eval': {
           # If 0, evaluation is disabled. Otherwise run every `interval` steps.
-          'interval': 40000,
+          'interval': 20000,
           # Number of evaluation iterations (MCMC + loss eval) per eval event.
-          'iterations': 5000,
+          'iterations': 2000,
       },
       'system': {
           'type': SystemType.MOLECULE.value,
@@ -150,20 +152,6 @@ def default() -> ml_collections.ConfigDict:
           # 'angstrom'. Internally work in a.u.; positions in
           # Angstroms are converged to Bohr.
           'units': 'bohr',
-          # If true, use pseudopotentials
-          'use_pp': False,
-          # Config for pseudopotential if cfg.system.pp is True
-          'pp': {
-              # If a pseudopotential is used, specify which. Ignored if no
-              # pseudopotential is used.
-              'type': 'ccecp',
-              # If a pseudopotential is used, specify the basis set. Ignored if
-              # no pseudopotential is used.
-              'basis': 'ccecp-cc-pVDZ',
-              # If a pseudopotential is used, list the symbols of elements for
-              # which it will be used.
-              'symbols': None,
-          },
           # 2. Specify the system using pyscf. Must be a pyscf.gto.Mole object.
           'pyscf_mol': None,
           # 3. Specify the system inside a function evaluated after the config
@@ -172,14 +160,6 @@ def default() -> ml_collections.ConfigDict:
           # other related values and returns the ConfigDict with these set.
           # Note: modifications may also be performed in-place.
           'set_molecule': None,
-          # String set to module.make_local_energy, where make_local_energy is a
-          # callable (type: MakeLocalEnergy) which creates a function which
-          # evaluates the local energy and module is the absolute module
-          # containing make_local_energy.
-          # If not set, hamiltonian.local_energy is used.
-          'make_local_energy_fn': '',
-          # Additional kwargs to pass into make_local_energy_fn.
-          'make_local_energy_kwargs': {},
       },
       'mcmc': {
           # Note: HMC options are not currently used.
@@ -220,7 +200,7 @@ def default() -> ml_collections.ConfigDict:
               'num_heads': 4,
               'heads_dim': 64,
               'mlp_hidden_dims': (256,),
-              'use_layer_norm': True,
+              'use_layer_norm': False,
               'activation': 'tanh',
           },
           'determinants': 16,  # Number of determinants.
@@ -238,17 +218,11 @@ def default() -> ml_collections.ConfigDict:
           # make_feature_layer.
           # If not set, networks.make_ferminet_features is used.
           'make_feature_layer_fn': '',
-          # Additional kwargs to pass into make_local_energy_fn.
+          # Additional kwargs to pass into make_feature_layer_fn.
           'make_feature_layer_kwargs': {},
           # Same structure as make_feature_layer
           'make_envelope_fn': '',
           'make_envelope_kwargs': {},
-      },
-      'observables': {
-          's2': False,  # spin magnitude
-          'density': False,  # density matrix
-          'density_basis': 'def2-tzvpd',  # basis used for DM calculation
-          'dipole': False,  # dipole moment
       },
       'debug': {
           # Check optimizer state, parameters and loss and raise an exception if
@@ -258,7 +232,7 @@ def default() -> ml_collections.ConfigDict:
       },
       'pretrain': {
           'method': 'hf',  # Currently only 'hf' is supported.
-          'iterations': 20000,  # Only used if method is 'hf'.
+          'iterations': 100000,  # Only used if method is 'hf'.
           'basis': 'ccpvdz',  # Larger than STO-6G, but good for excited states
           # Fraction of SCF to use in pretraining MCMC. This enables pretraining
           # similar to the original FermiNet paper.

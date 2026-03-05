@@ -18,7 +18,6 @@ from typing import Any, Callable, Sequence, Tuple, Union
 
 import chex
 from ferminet import networks
-from ferminet import pseudopotential as pp
 from ferminet.utils import utils
 import folx
 import jax
@@ -194,8 +193,6 @@ def local_energy(
     nspins: Sequence[int],
     use_scan: bool = False,
     laplacian_method: str = 'default',
-    pp_type: str = 'ccecp',
-    pp_symbols: Sequence[str] | None = None,
 ) -> LocalEnergy:
   """Creates the function to evaluate the local energy.
 
@@ -208,10 +205,6 @@ def local_energy(
     laplacian_method: Laplacian calculation method. One of:
       'default': take jvp(grad), looping over inputs
       'folx': use Microsoft's implementation of forward laplacian
-    pp_type: type of pseudopotential to use. Only used if ecp_symbols is
-      provided.
-    pp_symbols: sequence of element symbols for which the pseudopotential is
-      used.
 
   Returns:
     Callable with signature e_l(params, key, data) which evaluates the local
@@ -219,22 +212,6 @@ def local_energy(
     and a single MCMC configuration in data.
   """
   del nspins
-
-  if not pp_symbols:
-    effective_charges = charges
-    use_pp = False
-  else:
-    effective_charges, pp_local, pp_nonlocal = pp.make_pp_potential(
-        charges=charges,
-        symbols=pp_symbols,
-        quad_degree=4,
-        ecp=pp_type,
-    )
-    use_pp = not jnp.all(effective_charges == charges)
-
-  if not use_pp:
-    pp_local = lambda *args, **kwargs: 0.0
-    pp_nonlocal = lambda *args, **kwargs: 0.0
 
   def _e_l(
       params: networks.ParamTree, key: chex.PRNGKey, data: networks.FermiNetData
@@ -252,9 +229,8 @@ def local_energy(
     ae, _, r_ae, r_ee = networks.construct_input_features(
         data.positions, data.atoms
     )
-    potential = (potential_energy(r_ae, r_ee, data.atoms, effective_charges) +
-                 pp_local(r_ae) +
-                 pp_nonlocal(key, f, params, data, ae, r_ae))
+    del key, ae
+    potential = potential_energy(r_ae, r_ee, data.atoms, charges)
     kinetic = ke(params, data)
     return potential + kinetic
 

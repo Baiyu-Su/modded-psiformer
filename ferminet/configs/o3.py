@@ -1,4 +1,4 @@
-# Copyright 2024 DeepMind Technologies Limited.
+# Copyright 2026 Simple PSI Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,25 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Config to reproduce Fig. 1 from Pfau et al. (2024)."""
+"""Ozone (O3) example config."""
 
 from ferminet import base_config
-from ferminet.configs import atom
-from ferminet.configs.excited import presets
+from ferminet.utils import system
 import ml_collections
 
 
 def get_config() -> ml_collections.ConfigDict:
-  """Returns config for running generic atoms with qmc."""
+  """Returns config for running O3 with FermiNet."""
   cfg = base_config.default()
-  cfg.system.atom = ''
-  cfg.system.charge = 0
-  cfg.system.delta_charge = 0.0
-  cfg.system.states = 5
-  cfg.system.spin_polarisation = ml_collections.FieldReference(
-      None, field_type=int)
-  cfg.pretrain.iterations = 10_000
-  cfg.update_from_flattened_dict(presets.excited_states)
-  with cfg.ignore_type():
-    cfg.system.set_molecule = atom.adjust_nuclear_charge
+
+  cfg.system.molecule = [
+      system.Atom(symbol='O', coords=(0.0, 2.0859, -0.4319), units='bohr'),
+      system.Atom(symbol='O', coords=(0.0, 0.0, 0.8638), units='bohr'),
+      system.Atom(symbol='O', coords=(0.0, -2.0859, -0.4319), units='bohr'),
+  ]
+  cfg.system.electrons = (12, 12)
+  with cfg.system.ignore_type():
+    cfg.system.atom_spin_configs = ((4, 4), (4, 4), (4, 4))
   return cfg

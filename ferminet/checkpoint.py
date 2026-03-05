@@ -22,7 +22,6 @@ import zipfile
 
 from absl import logging
 from ferminet import networks
-from ferminet import observables
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -94,8 +93,7 @@ def save(save_path: str,
          data: networks.FermiNetData,
          params,
          opt_state,
-         mcmc_width,
-         density_state: Optional[observables.DensityState] = None) -> str:
+         mcmc_width) -> str:
   """Saves checkpoint information to a npz file.
 
   Args:
@@ -107,7 +105,6 @@ def save(save_path: str,
     params: pytree of network parameters.
     opt_state: optimization state.
     mcmc_width: width to use in the MCMC proposal distribution.
-    density_state: optional state of the density matrix calculation
 
   Returns:
     path to checkpoint file.
@@ -121,9 +118,7 @@ def save(save_path: str,
         data=dataclasses.asdict(data),
         params=params,
         opt_state=np.asarray(opt_state, dtype=object),
-        mcmc_width=mcmc_width,
-        density_state=(dataclasses.asdict(density_state)
-                       if density_state else None))
+        mcmc_width=mcmc_width)
   return ckpt_filename
 
 
@@ -143,7 +138,6 @@ def restore(restore_filename: str, batch_size: Optional[int] = None):
     params: pytree of network parameters.
     opt_state: optimization state.
     mcmc_width: width to use in the MCMC proposal distribution.
-    density_state: optional state of the density matrix calculation
 
   Raises:
     ValueError: if the leading dimension of data does not match the number of
@@ -161,11 +155,6 @@ def restore(restore_filename: str, batch_size: Optional[int] = None):
     params = ckpt_data['params'].tolist()
     opt_state = ckpt_data['opt_state'].tolist()
     mcmc_width = jnp.array(ckpt_data['mcmc_width'].tolist())
-    if ckpt_data['density_state']:
-      density_state = observables.DensityState(
-          **ckpt_data['density_state'].item())
-    else:
-      density_state = None
     if data.positions.shape[0] != jax.device_count():
       raise ValueError(
           'Incorrect number of devices found. Expected'
@@ -178,4 +167,4 @@ def restore(restore_filename: str, batch_size: Optional[int] = None):
       raise ValueError(
           f'Wrong batch size in loaded data. Expected {batch_size}, found '
           f'{data.positions.shape[0] * data.positions.shape[1]}.')
-  return t, data, params, opt_state, mcmc_width, density_state
+  return t, data, params, opt_state, mcmc_width
