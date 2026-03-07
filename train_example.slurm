@@ -14,7 +14,7 @@ mkdir -p logs
 # Source environment
 source ~/.bashrc
 source ~/miniconda3/etc/profile.d/conda.sh
-conda activate ferminet
+conda activate psiformer
 
 # Set up wandb (if using wandb monitoring)
 # export WANDB_API_KEY=your_api_key_here
@@ -26,8 +26,15 @@ export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 # Fix for JAX cuSPARSE library path issue (adjust path as needed)
 export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"
 
-# Enable JAX debugging and error reporting
-export JAX_ENABLE_X64=true
+# ── Strict FP32 precision ──
+# Disable FP64 (x64) mode — all default floats stay float32
+export JAX_ENABLE_X64=false
+# Force matmul to use full float32 (no TF32 shortcut inside JAX)
+export JAX_DEFAULT_MATMUL_PRECISION=highest
+# Disable TF32 at the CUDA/cuBLAS driver level
+export NVIDIA_TF32_OVERRIDE=0
+export CUDA_ALLOW_TF32=0
+# Disable JIT cache of any prior TF32/FP64 compiled kernels
 export JAX_DISABLE_JIT=false
 
 # Set up cache directories for JAX compilation
@@ -49,8 +56,8 @@ echo "Timestamp: $TIMESTEP"
 # Run FermiNet training with your configuration
 # Adjust config file and parameters as needed
 srun python3 -u ferminet/main.py \
-    --config ferminet/configs/c2h4.py \
-    --config.log.save_path="./runs/c2h4_${TIMESTEP}" \
+    --config ferminet/configs/bicbut.py \
+    --config.log.save_path="./runs/bicbut_${TIMESTEP}" \
     --config.log.use_wandb=False \
     --config.optim.kfac.nesterov=True \
     --config.optim.kfac.momentum=0.98 \
