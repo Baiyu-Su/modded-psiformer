@@ -31,4 +31,5 @@ def get_config() -> ml_collections.ConfigDict:
   cfg.system.electrons = (12, 12)
   with cfg.system.ignore_type():
     cfg.system.atom_spin_configs = ((4, 4), (4, 4), (4, 4))
+  cfg.pretrain.iterations = 20000
   return cfg
