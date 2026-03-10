@@ -72,4 +72,5 @@ def get_config():
   with cfg.ignore_type():
     cfg.system.set_molecule = adjust_nuclear_charge
     cfg.config_module = '.atom'
+  cfg.pretrain.iterations = 20000
   return cfg

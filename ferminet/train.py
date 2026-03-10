@@ -308,6 +308,20 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
   )
   t_init = 0
 
+  # Restart: load params, optimizer state, mcmc_width from checkpoint
+  restart_opt_state = None
+  restart_mcmc_width = None
+  if cfg.get('restart', {}).get('path', ''):
+    restart_ckpt_path = cfg.restart.path
+    logging.info('Restart: loading checkpoint %s', restart_ckpt_path)
+    (t_init,
+     _restart_data,
+     params,
+     restart_opt_state,
+     restart_mcmc_width) = checkpoint.restore(restart_ckpt_path, host_batch_size)
+    logging.info('Restart: loaded params from checkpoint, resuming at step %d',
+                 t_init)
+
   # Set up logging
   train_schema = ['step', 'energy', 'ewmean', 'ewvar', 'pmove']
 
@@ -342,6 +356,8 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
         iterations=cfg.pretrain.iterations,
         batch_size=device_batch_size,
         scf_fraction=cfg.pretrain.get('scf_fraction', 0.0),
+        optimizer_name=cfg.pretrain.get('optimizer', 'lamb'),
+        pretrain_lr=cfg.pretrain.get('lr', 3.e-4),
     )
 
   # Main training
@@ -439,6 +455,8 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
     )
     sharded_key, subkeys = kfac_jax.utils.p_split(sharded_key)
     opt_state = optimizer.init(params, subkeys, data)
+    if restart_opt_state is not None:
+      opt_state = restart_opt_state
   else:
     raise ValueError(f'Not a recognized optimizer: {cfg.optim.optimizer}')
 
@@ -450,6 +468,8 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
   elif isinstance(optimizer, optax.GradientTransformation):
     # optax/optax-compatible optimizer (ADAM, LAMB, ...)
     opt_state = jax.pmap(optimizer.init)(params)
+    if restart_opt_state is not None:
+      opt_state = tuple(restart_opt_state)
     step = make_training_step(
         mcmc_step=mcmc_step,
         optimizer_step=make_opt_update_step(evaluate_loss, optimizer),
@@ -469,6 +489,9 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
   mcmc_width = kfac_jax.utils.replicate_all_local_devices(
       jnp.asarray(cfg.mcmc.move_width)
   )
+  if restart_mcmc_width is not None:
+    mcmc_width = kfac_jax.utils.replicate_all_local_devices(
+        restart_mcmc_width[0])
   pmoves = np.zeros(cfg.mcmc.adapt_frequency)
 
   if t_init == 0:
@@ -491,6 +514,24 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
     ptotal_energy = constants.pmap(evaluate_loss)
     initial_energy, _ = ptotal_energy(params, subkeys, data)
     logging.info('Initial energy: %03.4f E_h', initial_energy[0])
+
+  if cfg.get('restart', {}).get('path', ''):
+    restart_burn_in_steps = cfg.restart.get('burn_in', 1000)
+    logging.info('Restart: burning in MCMC chain for %d steps',
+                 restart_burn_in_steps)
+    burn_in_step = make_training_step(
+        mcmc_step=mcmc_step,
+        optimizer_step=null_update)
+    for t in range(restart_burn_in_steps):
+      sharded_key, subkeys = kfac_jax.utils.p_split(sharded_key)
+      data, params, *_ = burn_in_step(
+          data, params, state=None, key=subkeys, mcmc_width=mcmc_width)
+    logging.info('Restart: completed burn-in MCMC steps')
+    sharded_key, subkeys = kfac_jax.utils.p_split(sharded_key)
+    ptotal_energy = constants.pmap(evaluate_loss)
+    initial_energy, _ = ptotal_energy(params, subkeys, data)
+    logging.info('Restart: initial energy after burn-in: %03.4f E_h',
+                 initial_energy[0])
 
   weighted_stats = None
 

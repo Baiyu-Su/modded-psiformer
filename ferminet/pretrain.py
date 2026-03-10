@@ -179,6 +179,8 @@ def pretrain_hartree_fock(
     batch_size: int = 0,
     logger: Callable[[int, float], None] | None = None,
     scf_fraction: float = 0.0,
+    optimizer_name: str = 'lamb',
+    pretrain_lr: float = 3.e-4,
 ):
   """Performs training to match initialization as closely as possible to HF.
 
@@ -218,7 +220,12 @@ def pretrain_hartree_fock(
   # Implementing the basis set in JAX would enable using GPUs and allow
   # eval_orbitals to be pmapped.
 
-  optimizer = optax.adam(3.e-4)
+  if optimizer_name == 'lamb':
+    optimizer = optax.lamb(pretrain_lr)
+  elif optimizer_name == 'adam':
+    optimizer = optax.adam(pretrain_lr)
+  else:
+    raise ValueError(f'Unknown pretrain optimizer: {optimizer_name}')
   opt_state_pt = constants.pmap(optimizer.init)(params)
 
   pretrain_step = make_pretrain_step(
