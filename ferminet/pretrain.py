@@ -14,6 +14,7 @@
 
 """Utilities for pretraining and importing PySCF models."""
 
+import functools
 from typing import Callable, Sequence, Tuple
 
 from absl import logging
@@ -25,7 +26,6 @@ from ferminet.utils import scf
 from ferminet.utils import system
 import jax
 from jax import numpy as jnp
-import kfac_jax
 import numpy as np
 import optax
 import pyscf
@@ -213,13 +213,20 @@ def pretrain_hartree_fock(
     that the orbitals in the network closely match Hartree-Fock and the MCMC
     configurations are drawn from the log probability of the network.
   """
+  is_host_0 = jax.process_index() == 0
+  local_device_count = jax.local_device_count()
   # Pretraining is slow on larger systems (very low GPU utilization) because the
   # Hartree-Fock orbitals are evaluated on CPU and only on a single host.
   # Implementing the basis set in JAX would enable using GPUs and allow
   # eval_orbitals to be pmapped.
 
+  if is_host_0:
+    logging.info('Initializing pretrain optimizer state on %d local devices.',
+                 local_device_count)
   optimizer = optax.adam(3.e-4)
   opt_state_pt = constants.pmap(optimizer.init)(params)
+  if is_host_0:
+    logging.info('Pretrain optimizer state initialized.')
 
   pretrain_step = make_pretrain_step(
       batch_orbitals,
@@ -232,17 +239,211 @@ def pretrain_hartree_fock(
   )
   pretrain_step = constants.pmap(pretrain_step)
 
+  # All arrays must use PmapSharding (from broadcast_all_local_devices) to
+  # avoid CopyArrays errors when mixed with other pmap outputs in multi-host.
   batch_spins = jnp.tile(spins[None], [positions.shape[1], 1])
-  pmap_spins = kfac_jax.utils.replicate_all_local_devices(batch_spins)
-  data = networks.FermiNetData(
-      positions=positions, spins=pmap_spins, atoms=atoms, charges=charges
+  if is_host_0:
+    logging.info('Broadcasting pretrain spin configurations to local devices.')
+  pmap_spins = constants.broadcast(
+      jnp.tile(
+          batch_spins[None],
+          [local_device_count] + [1] * batch_spins.ndim,
+      )
   )
-
+  data = networks.FermiNetData(
+      positions=positions, spins=pmap_spins, atoms=atoms,
+      charges=charges
+  )
+  if is_host_0:
+    logging.info('Starting Hartree-Fock pretraining for %d iterations.',
+                 iterations)
   for t in range(iterations):
-    sharded_key, subkeys = kfac_jax.utils.p_split(sharded_key)
+    if t == 0 and is_host_0:
+      logging.info('Compiling/executing first pretrain step.')
+    sharded_key, subkeys = constants.p_split(sharded_key)
     data, params, opt_state_pt, loss, pmove = pretrain_step(
         data, params, opt_state_pt, subkeys, scf_approx)
-    logging.info('Pretrain iter %05d: %g %g', t, loss[0], pmove[0])
-    if logger:
+    if is_host_0:
+      logging.info('Pretrain iter %05d: %g %g', t, loss[0], pmove[0])
+    if logger and is_host_0:
       logger(t, loss[0])
   return params, data.positions
+
+
+def pretrain_hartree_fock_global(
+    *,
+    params: networks.ParamTree,
+    positions: jnp.ndarray,
+    spins: jnp.ndarray,
+    atoms: jnp.ndarray,
+    charges: jnp.ndarray,
+    batch_network: networks.FermiNetLike,
+    batch_orbitals: networks.OrbitalFnLike,
+    network_options: networks.BaseNetworkOptions,
+    key: chex.PRNGKey,
+    electrons: Tuple[int, int],
+    scf_approx: scf.Scf,
+    iterations: int = 1000,
+    batch_size: int = 0,
+    logger: Callable[[int, float], None] | None = None,
+    scf_fraction: float = 0.0,
+):
+  """Runs HF pretraining on a mesh-sharded global walker batch."""
+  is_host_0 = jax.process_index() == 0
+  mesh = constants.make_global_mesh()
+  batch_pspec = jax.sharding.PartitionSpec(constants.GLOBAL_BATCH_AXIS)
+  replicated = constants.replicated_sharding(mesh)
+  batch_sharding = constants.batch_sharding(mesh)
+  data_sharding = networks.FermiNetData(
+      positions=batch_sharding,
+      spins=batch_sharding,
+      atoms=batch_sharding,
+      charges=batch_sharding,
+  )
+
+  if is_host_0:
+    logging.info(
+        'Initializing mesh pretraining on %d global devices.',
+        jax.device_count(),
+    )
+    logging.info('Materializing host-local walker state as global arrays.')
+
+  global_positions = constants.host_local_to_global_array(
+      positions, mesh, batch_pspec
+  )
+  if is_host_0:
+    logging.info('Global walker positions ready.')
+  global_spins = constants.host_local_to_global_array(spins, mesh, batch_pspec)
+  if is_host_0:
+    logging.info('Global walker spins ready.')
+  global_atoms = constants.host_local_to_global_array(atoms, mesh, batch_pspec)
+  if is_host_0:
+    logging.info('Global atom batches ready.')
+  global_charges = constants.host_local_to_global_array(
+      charges, mesh, batch_pspec
+  )
+  if is_host_0:
+    logging.info('Global charge batches ready.')
+
+  optimizer = optax.adam(3.e-4)
+  opt_state = optimizer.init(params)
+  global_params = params
+  global_key = key
+  if is_host_0:
+    logging.info('Host-local optimizer state ready.')
+    logging.info('Global pretraining arrays/materialized state ready.')
+
+  full_det = network_options.full_det
+  if scf_fraction > 1 or scf_fraction < 0:
+    raise ValueError('scf_fraction must be in between 0 and 1, inclusive.')
+
+  scf_network = lambda fn, x: fn(x, electrons)[1]
+
+  if scf_fraction < 1e-6:
+    def mcmc_network(full_params, pos, walker_spins, walker_atoms, walker_charges):
+      return batch_network(
+          full_params['ferminet'],
+          pos,
+          walker_spins,
+          walker_atoms,
+          walker_charges,
+      )
+  elif scf_fraction > 0.999999:
+    def mcmc_network(full_params, pos, walker_spins, walker_atoms, walker_charges):
+      del walker_spins, walker_atoms, walker_charges
+      return scf_network(full_params['scf'].eval_slater, pos)
+  else:
+    def mcmc_network(full_params, pos, walker_spins, walker_atoms, walker_charges):
+      log_ferminet = batch_network(
+          full_params['ferminet'],
+          pos,
+          walker_spins,
+          walker_atoms,
+          walker_charges,
+      )
+      log_scf = scf_network(full_params['scf'].eval_slater, pos)
+      return (1 - scf_fraction) * log_ferminet + scf_fraction * log_scf
+
+  global_mcmc_step = mcmc.make_mcmc_step(
+      mcmc_network, batch_per_device=batch_size, steps=1
+  )
+
+  def loss_fn(
+      current_params: networks.ParamTree,
+      data: networks.FermiNetData,
+  ) -> jnp.ndarray:
+    target = scf_approx.eval_orbitals(data.positions, electrons)
+    orbitals = batch_orbitals(
+        current_params, data.positions, data.spins, data.atoms, data.charges
+    )
+    cnorm = lambda x, y: (x - y) ** 2
+    if full_det:
+      dims = target[0].shape[:-2]
+      na = target[0].shape[-2]
+      nb = target[1].shape[-2]
+      target_full = jnp.concatenate(
+          (
+              jnp.concatenate(
+                  (target[0], jnp.zeros(dims + (na, nb))), axis=-1
+              ),
+              jnp.concatenate(
+                  (jnp.zeros(dims + (nb, na)), target[1]), axis=-1
+              ),
+          ),
+          axis=-2,
+      )
+      return jnp.mean(cnorm(target_full[:, None, ...], orbitals[0]))
+    return jnp.array([
+        jnp.mean(cnorm(t[:, None, ...], o))
+        for t, o in zip(target, orbitals)
+    ]).sum()
+
+  @functools.partial(
+      jax.jit,
+      in_shardings=(replicated, replicated, data_sharding, replicated),
+      out_shardings=(replicated, replicated, data_sharding, replicated, replicated),
+  )
+  def pretrain_step(
+      current_params,
+      current_opt_state,
+      data,
+      step_key,
+  ):
+    loss_val, grads = jax.value_and_grad(loss_fn)(current_params, data)
+    updates, next_opt_state = optimizer.update(
+        grads, current_opt_state, current_params
+    )
+    next_params = optax.apply_updates(current_params, updates)
+    full_params = {'ferminet': next_params, 'scf': scf_approx}
+    next_data, pmove = global_mcmc_step(
+        full_params, data, step_key, width=0.02
+    )
+    return next_params, next_opt_state, next_data, loss_val, pmove
+
+  data = networks.FermiNetData(
+      positions=global_positions,
+      spins=global_spins,
+      atoms=global_atoms,
+      charges=global_charges,
+  )
+  if is_host_0:
+    logging.info(
+        'Starting mesh Hartree-Fock pretraining for %d iterations.', iterations
+    )
+  for t in range(iterations):
+    if t == 0 and is_host_0:
+      logging.info('Compiling/executing first mesh pretrain step.')
+    global_key, step_key = jax.random.split(global_key)
+    global_params, opt_state, data, loss, pmove = pretrain_step(
+        global_params, opt_state, data, step_key
+    )
+    if is_host_0:
+      logging.info('Pretrain iter %05d: %g %g', t, loss, pmove)
+    if logger and is_host_0:
+      logger(t, float(loss))
+
+  host_positions = constants.global_array_to_host_local_array(
+      data.positions, mesh, batch_pspec
+  )
+  host_params = jax.tree_util.tree_map(np.asarray, global_params)
+  return host_params, host_positions

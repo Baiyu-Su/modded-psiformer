@@ -20,6 +20,19 @@ from typing import Optional, Sequence
 from absl import logging
 
 
+class NoOpWriter(contextlib.AbstractContextManager):
+  """A writer that does nothing, used on non-primary hosts."""
+
+  def __enter__(self):
+    return self
+
+  def write(self, t: int, **data):
+    del t, data
+
+  def __exit__(self, exc_type, exc_val, exc_tb):
+    return False
+
+
 class Writer(contextlib.AbstractContextManager):
   """Write data to CSV, as well as logging data to stdout if desired."""
 
@@ -40,8 +53,7 @@ class Writer(contextlib.AbstractContextManager):
       log: Also log each entry to stdout.
     """
     self._schema = schema
-    if not os.path.isdir(directory):
-      os.mkdir(directory)
+    os.makedirs(directory, exist_ok=True)
     self._filename = os.path.join(directory, name + '.csv')
     self._iteration_key = iteration_key
     self._log = log
@@ -52,6 +64,7 @@ class Writer(contextlib.AbstractContextManager):
     if self._iteration_key:
       self._file.write(f'{self._iteration_key},')
     self._file.write(','.join(self._schema) + '\n')
+    self._file.flush()
     return self
 
   def write(self, t: int, **data):
@@ -70,6 +83,7 @@ class Writer(contextlib.AbstractContextManager):
 
     # write the data to csv
     self._file.write(','.join(row) + '\n')
+    self._file.flush()
 
     # write the data to abseil logs
     if self._log:

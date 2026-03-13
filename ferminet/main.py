@@ -14,6 +14,8 @@
 
 """Main wrapper for FermiNet in JAX."""
 
+import os
+
 from absl import app
 from absl import flags
 from absl import logging
@@ -28,10 +30,26 @@ FLAGS = flags.FLAGS
 config_flags.DEFINE_config_file('config', None, 'Path to config file.')
 
 
+def _infer_local_device_ids():
+  """Infers process-local device ids from CUDA_VISIBLE_DEVICES when set."""
+  visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES', '').strip()
+  if not visible_devices or visible_devices == 'NoDevFiles':
+    return None
+  device_tokens = [token.strip() for token in visible_devices.split(',')
+                   if token.strip()]
+  if not device_tokens:
+    return None
+  # CUDA_VISIBLE_DEVICES remaps ordinals inside the process to [0, n).
+  return list(range(len(device_tokens)))
+
+
 def main(_):
   cfg = FLAGS.config
   cfg = base_config.resolve(cfg)
-  logging.info('System config:\n\n%s', cfg)
+  import jax
+  jax.distributed.initialize(local_device_ids=_infer_local_device_ids())
+  if jax.process_index() == 0:
+    logging.info('System config:\n\n%s', cfg)
   train.train(cfg)
 
 

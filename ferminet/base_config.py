@@ -103,13 +103,10 @@ def default() -> ml_collections.ConfigDict:
       },
       'log': {
           'stats_frequency': 100,  # iterations between logging of stats
-          'save_frequency': 240.0,  # minutes between saving network params
-          # Path to save/restore network to/from. If falsy,
-          # creates a timestamped directory in the working directory.
+          'save_frequency': 4000,  # steps between saving network params
+          # Path to save network to. If falsy, creates a timestamped directory
+          # in the working directory.
           'save_path': '',
-          # Path containing checkpoint to restore network from.
-          # Ignored if falsy or save_path contains a checkpoint.
-          'restore_path': '',
           # Remaining log options are currently not functional.  Whether or not
           # to log the values of all walkers every iteration Use with caution!!!
           # Produces a lot of data very quickly.
@@ -232,7 +229,7 @@ def default() -> ml_collections.ConfigDict:
       },
       'pretrain': {
           'method': 'hf',  # Currently only 'hf' is supported.
-          'iterations': 100000,  # Only used if method is 'hf'.
+          'iterations': 20000,  # Only used if method is 'hf'.
           'basis': 'ccpvdz',  # Larger than STO-6G, but good for excited states
           # Fraction of SCF to use in pretraining MCMC. This enables pretraining
           # similar to the original FermiNet paper.

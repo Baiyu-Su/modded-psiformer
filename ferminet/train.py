@@ -17,8 +17,10 @@
 from __future__ import annotations
 
 import importlib
+import os
 import time
 from typing import Sequence, Tuple
+import zlib
 
 from absl import logging
 import wandb
@@ -41,17 +43,23 @@ from ferminet.steps import (
     null_update,
 )
 from ferminet.utils import precision as precision_utils
+from ferminet.utils import sanity_checks
 from ferminet.utils import statistics
 from ferminet.utils import system
 from ferminet.utils import writers
 from ferminet.utils import optim_logging
 import jax
-from jax.experimental import multihost_utils
 import jax.numpy as jnp
 import kfac_jax
 import ml_collections
 import numpy as np
 import optax
+
+
+def _make_sharded_key(rng):
+  rng = jax.random.fold_in(rng, jax.process_index())
+  rng = jax.random.split(rng, jax.local_device_count())
+  return constants.broadcast(rng)
 
 
 def _assign_spin_configuration(
@@ -150,6 +158,25 @@ def _run_save_path(save_path: str) -> str:
   """Returns the run output directory, creating it if needed."""
   return checkpoint.create_save_path(save_path)
 
+
+def _shared_run_seed(
+    save_path: str,
+    *,
+    deterministic: bool,
+    num_hosts: int,
+) -> int:
+  """Returns a host-consistent seed without cross-host device collectives."""
+  if deterministic:
+    return 23
+  if num_hosts == 1:
+    return int(1e6 * time.time())
+  seed_source = ':'.join((
+      os.environ.get('SLURM_JOB_ID', '0'),
+      os.environ.get('SLURM_STEP_ID', '0'),
+      save_path,
+  ))
+  return zlib.crc32(seed_source.encode('utf-8')) & 0x7FFFFFFF
+
 def train(cfg: ml_collections.ConfigDict, writer_manager=None):
   """Runs training loop for QMC.
 
@@ -167,8 +194,10 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
   # Device logging
   num_devices = jax.local_device_count()
   num_hosts = jax.device_count() // num_devices
-  logging.info('Starting QMC with %i XLA devices per host '
-               'across %i hosts.', num_devices, num_hosts)
+  is_host_0 = jax.process_index() == 0
+  if is_host_0:
+    logging.info('Starting QMC with %i XLA devices per host '
+                 'across %i hosts.', num_devices, num_hosts)
   if cfg.batch_size % (num_devices * num_hosts) != 0:
     raise ValueError('Batch size must be divisible by number of devices, '
                      f'got batch size {cfg.batch_size} for '
@@ -177,17 +206,17 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
   total_host_batch_size = host_batch_size
   device_batch_size = host_batch_size // num_devices  # batch size per device
   data_shape = (num_devices, device_batch_size)
+  # Index into pmap output arrays to get the local device's shard.
+  # In multi-host JAX, pmap outputs are globally-sharded; indexing with [0]
+  # on a non-primary host accesses a remote shard and crashes.
+  # Each host must use its own local shard index instead.
+  local_pmap_idx = jax.process_index() * num_devices
   run_save_path = _run_save_path(cfg.log.save_path)
   with cfg.ignore_type():
     cfg.log.save_path = run_save_path
-  if cfg.log.get('restore_path'):
-    logging.warning(
-        'Ignoring cfg.log.restore_path because full checkpoint restore has '
-        'been removed in this training mode.'
-    )
 
-  # Initialize wandb if enabled
-  if cfg.log.get('use_wandb', False):
+  # Initialize wandb if enabled — only on host 0 to avoid duplicate runs.
+  if is_host_0 and cfg.log.get('use_wandb', False):
     wandb_config = cfg.log.get('wandb', {})
     wandb.init(
         project=wandb_config.get('project', 'ferminet'),
@@ -208,34 +237,54 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
   charges = jnp.array([atom.charge for atom in cfg.system.molecule])
   nspins = cfg.system.electrons
 
-  # Generate atomic configurations for each walker
+  # Generate atomic configurations for each walker.
+  # Use broadcast_all_local_devices (pmap-based) for ALL arrays to ensure
+  # consistent PmapSharding. Mixing device_put_replicated (from
+  # replicate_all_local_devices) with PmapSharding arrays in the same pmap
+  # call causes CopyArrays errors in multi-host JAX.
   batch_atoms = jnp.tile(atoms[None, ...], [device_batch_size, 1, 1])
-  batch_atoms = kfac_jax.utils.replicate_all_local_devices(batch_atoms)
+  batch_atoms = constants.broadcast(
+      jnp.tile(batch_atoms[None], [num_devices] + [1] * batch_atoms.ndim))
   batch_charges = jnp.tile(charges[None, ...], [device_batch_size, 1])
-  batch_charges = kfac_jax.utils.replicate_all_local_devices(batch_charges)
+  batch_charges = constants.broadcast(
+      jnp.tile(batch_charges[None], [num_devices] + [1] * batch_charges.ndim))
 
-  if cfg.debug.deterministic:
-    seed = 23
-  else:
-    seed = jnp.asarray([1e6 * time.time()])
-    seed = int(multihost_utils.broadcast_one_to_all(seed)[0])
+  seed = _shared_run_seed(
+      cfg.log.save_path,
+      deterministic=cfg.debug.deterministic,
+      num_hosts=num_hosts,
+  )
+  if is_host_0:
+    logging.info('Using shared run seed %d.', seed)
   key = jax.random.PRNGKey(seed)
 
   # Create parameters, network, and vmaped/pmaped derivations
 
   if cfg.pretrain.method == 'hf' and cfg.pretrain.iterations > 0:
-    hartree_fock = pretrain.get_hf(
-        pyscf_mol=cfg.system.get('pyscf_mol'),
-        molecule=cfg.system.molecule,
-        nspins=nspins,
-        restricted=False,
-        basis=cfg.pretrain.basis,
-        )
-    # broadcast the result of PySCF from host 0 to all other hosts
-    hartree_fock.mean_field.mo_coeff = multihost_utils.broadcast_one_to_all(
-        hartree_fock.mean_field.mo_coeff
-    )
-
+    if is_host_0:
+      logging.info('Running Hartree-Fock setup on each host.')
+    # All hosts need the PySCF object for orbital evaluation.
+    # Suppress PySCF stdout on non-primary hosts to avoid duplicate logs.
+    if not is_host_0:
+      import contextlib, io
+      with contextlib.redirect_stdout(io.StringIO()):
+        hartree_fock = pretrain.get_hf(
+            pyscf_mol=cfg.system.get('pyscf_mol'),
+            molecule=cfg.system.molecule,
+            nspins=nspins,
+            restricted=False,
+            basis=cfg.pretrain.basis,
+            )
+    else:
+      hartree_fock = pretrain.get_hf(
+          pyscf_mol=cfg.system.get('pyscf_mol'),
+          molecule=cfg.system.molecule,
+          nspins=nspins,
+          restricted=False,
+          basis=cfg.pretrain.basis,
+          )
+    if is_host_0:
+      logging.info('Hartree-Fock setup complete on host 0.')
   if cfg.network.make_feature_layer_fn:
     feature_layer_module, feature_layer_fn = (
         cfg.network.make_feature_layer_fn.rsplit('.', maxsplit=1))
@@ -279,8 +328,7 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
   )
   key, subkey = jax.random.split(key)
   params = network.init(subkey)
-  
-  params = kfac_jax.utils.replicate_all_local_devices(params)
+
   signed_network = network.apply
   # Often just need log|psi(x)|.
   logabs_network = lambda *args, **kwargs: signed_network(*args, **kwargs)[1]
@@ -288,32 +336,23 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
       logabs_network, in_axes=(None, 0, 0, 0, 0), out_axes=0
   )  # batched network
 
-  # Initialize new data state. Legacy full checkpoint restore is disabled.
   key, subkey = jax.random.split(key)
   # Make sure data on each host is initialized differently.
   subkey = jax.random.fold_in(subkey, jax.process_index())
-  pos, spins = init_electrons(
+  host_positions, host_spins = init_electrons(
       subkey,
       cfg.system.molecule,
       cfg.system.electrons,
       batch_size=total_host_batch_size,
       init_width=cfg.mcmc.init_width,
   )
-  pos = jnp.reshape(pos, data_shape + (-1,))
-  pos = kfac_jax.utils.broadcast_all_local_devices(pos)
-  spins = jnp.reshape(spins, data_shape + (-1,))
-  spins = kfac_jax.utils.broadcast_all_local_devices(spins)
-  data = networks.FermiNetData(
-      positions=pos, spins=spins, atoms=batch_atoms, charges=batch_charges
-  )
+  host_batch_atoms = jnp.tile(atoms[None, ...], [host_batch_size, 1, 1])
+  host_batch_charges = jnp.tile(charges[None, ...], [host_batch_size, 1])
+  pretrain_spins_local = host_spins[0]
   t_init = 0
 
   # Set up logging
   train_schema = ['step', 'energy', 'ewmean', 'ewvar', 'pmove']
-
-  # Initialisation done. We now want to have different PRNG streams on each
-  # device. Shard the key over devices
-  sharded_key = kfac_jax.utils.make_different_rng_key_on_all_devices(key)
 
   # Pretraining to match Hartree-Fock
 
@@ -322,27 +361,85 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
       and cfg.pretrain.method == 'hf'
       and cfg.pretrain.iterations > 0
   ):
-    pretrain_spins = spins[0, 0]
+    sanity_checks.assert_global_device_topology('Pretraining startup')
+    sanity_checks.assert_distinct_host_positions(
+        'Pretraining startup', host_positions
+    )
+    if is_host_0:
+      logging.info('Starting Hartree-Fock pretraining on %d hosts x %d local '
+                   'devices (device_batch_size=%d).',
+                   num_hosts, num_devices, device_batch_size)
     batch_orbitals = jax.vmap(
         network.orbitals, in_axes=(None, 0, 0, 0, 0), out_axes=0
     )
-    sharded_key, subkeys = kfac_jax.utils.p_split(sharded_key)
-    params, data.positions = pretrain.pretrain_hartree_fock(
-        params=params,
-        positions=data.positions,
-        spins=pretrain_spins,
-        atoms=data.atoms,
-        charges=data.charges,
-        batch_network=batch_network,
-        batch_orbitals=batch_orbitals,
-        network_options=network.options,
-        sharded_key=subkeys,
-        electrons=cfg.system.electrons,
-        scf_approx=hartree_fock,
-        iterations=cfg.pretrain.iterations,
-        batch_size=device_batch_size,
-        scf_fraction=cfg.pretrain.get('scf_fraction', 0.0),
-    )
+    if jax.device_count() > 1 and num_devices > 1:
+      params, host_positions = pretrain.pretrain_hartree_fock_global(
+          params=params,
+          positions=host_positions,
+          spins=host_spins,
+          atoms=host_batch_atoms,
+          charges=host_batch_charges,
+          batch_network=batch_network,
+          batch_orbitals=batch_orbitals,
+          network_options=network.options,
+          key=key,
+          electrons=cfg.system.electrons,
+          scf_approx=hartree_fock,
+          iterations=cfg.pretrain.iterations,
+          batch_size=cfg.batch_size,
+          scf_fraction=cfg.pretrain.get('scf_fraction', 0.0),
+      )
+    else:
+      sharded_key = _make_sharded_key(key)
+      params = constants.broadcast(
+          jax.tree_util.tree_map(
+              lambda x: jnp.broadcast_to(x[None], (num_devices,) + x.shape),
+              params))
+      pos = jnp.reshape(host_positions, data_shape + (-1,))
+      pos = constants.broadcast(pos)
+      spins = jnp.reshape(host_spins, data_shape + (-1,))
+      spins = constants.broadcast(spins)
+      data = networks.FermiNetData(
+          positions=pos, spins=spins, atoms=batch_atoms, charges=batch_charges
+      )
+      sharded_key, subkeys = constants.p_split(sharded_key)
+      params, data.positions = pretrain.pretrain_hartree_fock(
+          params=params,
+          positions=data.positions,
+          spins=pretrain_spins_local,
+          atoms=data.atoms,
+          charges=data.charges,
+          batch_network=batch_network,
+          batch_orbitals=batch_orbitals,
+          network_options=network.options,
+          sharded_key=subkeys,
+          electrons=cfg.system.electrons,
+          scf_approx=hartree_fock,
+          iterations=cfg.pretrain.iterations,
+          batch_size=device_batch_size,
+          scf_fraction=cfg.pretrain.get('scf_fraction', 0.0),
+      )
+    if is_host_0:
+      logging.info('Hartree-Fock pretraining complete.')
+
+  params = constants.broadcast(
+      jax.tree_util.tree_map(
+          lambda x: jnp.broadcast_to(x[None], (num_devices,) + x.shape),
+          params))
+  pos = jnp.reshape(host_positions, data_shape + (-1,))
+  pos = constants.broadcast(pos)
+  spins = jnp.reshape(host_spins, data_shape + (-1,))
+  spins = constants.broadcast(spins)
+  data = networks.FermiNetData(
+      positions=pos, spins=spins, atoms=batch_atoms, charges=batch_charges
+  )
+
+  # Initialisation done. We now want to have different PRNG streams on each
+  # device. Shard the key over devices
+  sharded_key = _make_sharded_key(key)
+
+  sanity_checks.assert_global_device_topology('Training startup')
+  sanity_checks.assert_distinct_host_positions('Training startup', host_positions)
 
   # Main training
 
@@ -422,6 +519,7 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
         learning_rate_schedule=learning_rate_schedule,
         momentum_schedule=momentum_schedule,
         curvature_ema=cfg.optim.kfac.cov_ema_decay,
+        curvature_update_period=cfg.optim.kfac.cov_update_every,
         inverse_update_period=cfg.optim.kfac.invert_every,
         min_damping=cfg.optim.kfac.min_damping,
         num_burnin_steps=0,
@@ -437,8 +535,12 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
         constrain_l2=cfg.optim.kfac.constrain_l2,
         # debug=True
     )
-    sharded_key, subkeys = kfac_jax.utils.p_split(sharded_key)
+    if is_host_0:
+      logging.info('Initializing KFAC optimizer state.')
+    sharded_key, subkeys = constants.p_split(sharded_key)
     opt_state = optimizer.init(params, subkeys, data)
+    if is_host_0:
+      logging.info('KFAC optimizer state initialized.')
   else:
     raise ValueError(f'Not a recognized optimizer: {cfg.optim.optimizer}')
 
@@ -449,7 +551,7 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
         optimizer_step=make_loss_step(evaluate_loss))
   elif isinstance(optimizer, optax.GradientTransformation):
     # optax/optax-compatible optimizer (ADAM, LAMB, ...)
-    opt_state = jax.pmap(optimizer.init)(params)
+    opt_state = constants.pmap(optimizer.init)(params)
     step = make_training_step(
         mcmc_step=mcmc_step,
         optimizer_step=make_opt_update_step(evaluate_loss, optimizer),
@@ -466,50 +568,59 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
   # Build evaluation step (independent of optimizer type)
   eval_step = make_eval_step(mcmc_step=mcmc_step, evaluate_loss=evaluate_loss)
 
-  mcmc_width = kfac_jax.utils.replicate_all_local_devices(
-      jnp.asarray(cfg.mcmc.move_width)
+  mcmc_width_value = cfg.mcmc.move_width
+  mcmc_width = constants.broadcast(
+      jnp.full((num_devices,), mcmc_width_value)
   )
   pmoves = np.zeros(cfg.mcmc.adapt_frequency)
 
   if t_init == 0:
-    logging.info('Burning in MCMC chain for %d steps', cfg.mcmc.burn_in)
+    if is_host_0:
+      logging.info('Burning in MCMC chain for %d steps', cfg.mcmc.burn_in)
 
     burn_in_step = make_training_step(
-        mcmc_step=mcmc_step, 
+        mcmc_step=mcmc_step,
         optimizer_step=null_update)
 
     for t in range(cfg.mcmc.burn_in):
-      sharded_key, subkeys = kfac_jax.utils.p_split(sharded_key)
+      sharded_key, subkeys = constants.p_split(sharded_key)
       data, params, *_ = burn_in_step(
           data,
           params,
           state=None,
           key=subkeys,
           mcmc_width=mcmc_width)
-    logging.info('Completed burn-in MCMC steps')
-    sharded_key, subkeys = kfac_jax.utils.p_split(sharded_key)
+    if is_host_0:
+      logging.info('Completed burn-in MCMC steps')
+    sharded_key, subkeys = constants.p_split(sharded_key)
     ptotal_energy = constants.pmap(evaluate_loss)
     initial_energy, _ = ptotal_energy(params, subkeys, data)
-    logging.info('Initial energy: %03.4f E_h', initial_energy[0])
+    if is_host_0:
+      logging.info('Initial energy: %03.4f E_h', initial_energy[0])
 
   weighted_stats = None
 
   if writer_manager is None:
-    writer_manager = writers.Writer(
-        name='train_stats',
-        schema=train_schema,
-        directory=run_save_path,
-        iteration_key=None,
-        log=False)
+    if is_host_0:
+      writer_manager = writers.Writer(
+          name='train_stats',
+          schema=train_schema,
+          directory=run_save_path,
+          iteration_key=None,
+          log=False)
+    else:
+      writer_manager = writers.NoOpWriter()
   with writer_manager as writer:
-    # Log dtypes of key data structures
-    precision_utils.log_tree_dtypes(params, "params")
-    precision_utils.log_tree_dtypes(data, "data")
+    # Log dtypes of key data structures — only on host 0.
+    if is_host_0:
+      precision_utils.log_tree_dtypes(params, "params")
+      precision_utils.log_tree_dtypes(data, "data")
 
     # Main training loop
     num_resets = 0  # used if reset_if_nan is true
+    completed_step = t_init
     for t in range(t_init, cfg.optim.iterations):
-      sharded_key, subkeys = kfac_jax.utils.p_split(sharded_key)
+      sharded_key, subkeys = constants.p_split(sharded_key)
       data, params, opt_state, loss, aux_data, pmove, optimizer_stats = step(
           data,
           params,
@@ -518,13 +629,14 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
           mcmc_width)
 
       # due to pmean, loss, and pmove should be the same across
-      # devices.
-      loss = loss[0]
+      # devices. Use local shard index (not [0]) to avoid accessing
+      # a remote shard in multi-host JAX.
+      loss = loss[local_pmap_idx]
       # per batch variance isn't informative. Use weighted mean and variance
       # instead.
       weighted_stats = statistics.exponentialy_weighted_stats(
           alpha=0.1, observation=loss, previous_stats=weighted_stats)
-      pmove = pmove[0]
+      pmove = pmove[local_pmap_idx]
 
       # Update MCMC move width
       if cfg.mcmc.get('algorithm', 'mh') == 'mala':
@@ -557,8 +669,8 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
 
       completed_step = t + 1
 
-      # Logging
-      if t % cfg.log.stats_frequency == 0:
+      # Logging — only on host 0.
+      if is_host_0 and t % cfg.log.stats_frequency == 0:
         logging_str = ('Step %05d: '
                        '%03.4f E_h, exp. variance=%03.4f E_h^2, pmove=%0.2f')
         logging_args = t, loss, weighted_stats.variance, pmove
@@ -572,11 +684,11 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
         logging.info(logging_str, *logging_args)
         writer.write(t, **writer_kwargs)
         
-        # Log to wandb if enabled
-        if cfg.log.get('use_wandb', False):
+        # Log to wandb if enabled — only on host 0.
+        if is_host_0 and cfg.log.get('use_wandb', False):
           current_lr = learning_rate_schedule(jnp.asarray(t))
           current_mom = momentum_schedule(jnp.asarray(t))
-          
+
           wandb_log = {
               'step': t,
               'train/energy': float(loss),
@@ -593,12 +705,19 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
             wandb_log['train/grad_norm'] = float(optimizer_stats.grad_norm[0])
             wandb_log['train/precon_grad_norm'] = float(optimizer_stats.precon_grad_norm[0])
             wandb_log['train/update_norm'] = float(optimizer_stats.update_norm[0])
-          
+
           wandb.log(wandb_log)
 
           if optimizer_stats is not None and optimizer_stats.precon_grad_tree is not None:
             optim_logging.log_optim_rms_to_wandb(
                 optimizer_stats.precon_grad_tree, t)
+
+      # Checkpoint saving (step-based) — only on host 0.
+      if is_host_0 and (
+          cfg.log.save_frequency > 0
+          and completed_step % cfg.log.save_frequency == 0):
+        checkpoint.save(
+            run_save_path, completed_step, data, params, opt_state, mcmc_width)
 
       # Evaluation (checked after each training step)
       if cfg.get('eval', {}).get('interval', 0) and ((t + 1) % cfg.eval.interval == 0):
@@ -608,33 +727,40 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
           eval_pmoves = []
           eval_data = data
           # Run evaluation iterations (no parameter updates)
+          # eval_step is pmapped so must run on ALL hosts.
           for _ in range(num_eval_iters):
-            sharded_key, subkeys = kfac_jax.utils.p_split(sharded_key)
+            sharded_key, subkeys = constants.p_split(sharded_key)
             eval_data, _, _, eval_loss, _, eval_pmove, _ = eval_step(
                 eval_data,
                 params,
                 state=None,
                 key=subkeys,
                 mcmc_width=mcmc_width)
-            eval_losses.append(np.asarray(eval_loss[0]))
-            eval_pmoves.append(np.asarray(eval_pmove[0]))
+            if is_host_0:
+              eval_losses.append(np.asarray(eval_loss[0]))
+              eval_pmoves.append(np.asarray(eval_pmove[0]))
 
-          eval_losses = np.asarray(eval_losses)
-          eval_pmoves = np.asarray(eval_pmoves)
-          eval_mean = float(np.mean(eval_losses))
-          eval_var = float(np.var(eval_losses))
-          eval_pmove_mean = float(np.mean(eval_pmoves))
+          if is_host_0:
+            eval_losses = np.asarray(eval_losses)
+            eval_pmoves = np.asarray(eval_pmoves)
+            eval_mean = float(np.mean(eval_losses))
+            eval_var = float(np.var(eval_losses))
+            eval_pmove_mean = float(np.mean(eval_pmoves))
 
-          # Log to wandb if enabled
-          if cfg.log.get('use_wandb', False):
-            wandb.log({
-                'step': t + 1,
-                'eval/energy': eval_mean,
-                'eval/ewvar': eval_var,
-                'eval/pmove': eval_pmove_mean,
-            })
+            # Log to wandb if enabled.
+            if cfg.log.get('use_wandb', False):
+              wandb.log({
+                  'step': t + 1,
+                  'eval/energy': eval_mean,
+                  'eval/ewvar': eval_var,
+                  'eval/pmove': eval_pmove_mean,
+              })
 
-    # Shut down logging at end
-    # Finish wandb run if enabled
-    if cfg.log.get('use_wandb', False):
+    # Save final checkpoint — only on host 0.
+    if is_host_0:
+      checkpoint.save(
+          run_save_path, completed_step, data, params, opt_state, mcmc_width)
+
+    # Finish wandb run if enabled — only on host 0.
+    if is_host_0 and cfg.log.get('use_wandb', False):
       wandb.finish()

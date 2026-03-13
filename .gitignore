@@ -5,8 +5,10 @@
 logs/
 runs/
 train.slurm
+slurm/
 *.wandb
 .wandb/
+refs/
 __pycache__/
 .DS_Store
 *.swp

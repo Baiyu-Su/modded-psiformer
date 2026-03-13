@@ -18,10 +18,11 @@ def verify_precision_config():
   matmul_prec = str(jax.config.jax_default_matmul_precision)
   tf32_override = os.environ.get("NVIDIA_TF32_OVERRIDE", "<unset>")
 
-  logging.info(
-      "Precision config: x64=%s, matmul_precision=%s, NVIDIA_TF32_OVERRIDE=%s",
-      x64, matmul_prec, tf32_override,
-  )
+  if jax.process_index() == 0:
+    logging.info(
+        "Precision config: x64=%s, matmul_precision=%s, NVIDIA_TF32_OVERRIDE=%s",
+        x64, matmul_prec, tf32_override,
+    )
 
   errors = []
   if x64:

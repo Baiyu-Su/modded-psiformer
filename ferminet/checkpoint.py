@@ -22,7 +22,6 @@ import zipfile
 
 from absl import logging
 from ferminet import networks
-import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -67,25 +66,9 @@ def create_save_path(save_path: Optional[str]) -> str:
   timestamp = datetime.datetime.now().strftime('%Y_%m_%d_%H:%M:%S')
   default_save_path = os.path.join(os.getcwd(), f'ferminet_{timestamp}')
   ckpt_save_path = save_path or default_save_path
-  if ckpt_save_path and not os.path.isdir(ckpt_save_path):
-    os.makedirs(ckpt_save_path)
+  if ckpt_save_path:
+    os.makedirs(ckpt_save_path, exist_ok=True)
   return ckpt_save_path
-
-
-def get_restore_path(restore_path: Optional[str] = None) -> Optional[str]:
-  """Gets the path containing checkpoints from a previous calculation.
-
-  Args:
-    restore_path: path to checkpoints.
-
-  Returns:
-    The path or None if restore_path is falsy.
-  """
-  if restore_path:
-    ckpt_restore_path = restore_path
-  else:
-    ckpt_restore_path = None
-  return ckpt_restore_path
 
 
 def save(save_path: str,

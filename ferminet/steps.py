@@ -233,11 +233,15 @@ def make_kfac_training_step(
     update. See the Step protocol for details.
   """
   mcmc_step = constants.pmap(mcmc_step, donate_argnums=1)
-  shared_damping = kfac_jax.utils.replicate_all_local_devices(
-      jnp.asarray(damping))
+  shared_damping = constants.broadcast(
+      jnp.full((jax.local_device_count(),), damping))
   copy_tree = constants.pmap(
       functools.partial(jax.tree_util.tree_map,
                         lambda x: (1.0 * x).astype(x.dtype)))
+  # Track the KFAC step counter on the host side to avoid
+  # kfac_jax's get_first(step_counter) which does value[0] on a
+  # PmapSharding array — crashes on non-primary hosts in multi-host JAX.
+  kfac_step_counter = [0]
 
   def step(
       data: networks.FermiNetData,
@@ -247,7 +251,7 @@ def make_kfac_training_step(
       mcmc_width: jnp.ndarray,
   ) -> StepResults:
     """A full update iteration for KFAC: MCMC steps + optimization."""
-    mcmc_keys, loss_keys = kfac_jax.utils.p_split(key)
+    mcmc_keys, loss_keys = constants.p_split(key)
     data, pmove = mcmc_step(params, data, mcmc_keys, mcmc_width)
 
     if reset_if_nan:
@@ -260,7 +264,9 @@ def make_kfac_training_step(
         rng=loss_keys,
         batch=data,
         damping=shared_damping,
+        global_step_int=kfac_step_counter[0],
     )
+    kfac_step_counter[0] += 1
 
     if reset_if_nan and jnp.any(jnp.isnan(stats['loss'])):
       new_params = old_params
