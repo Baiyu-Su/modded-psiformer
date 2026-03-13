@@ -30,4 +30,5 @@ def get_config() -> ml_collections.ConfigDict:
       system.Atom(symbol='H', coords=(-1.53791, -0.88791, -0.51364)),
   ]
   cfg.system.electrons = (5, 5)
+  cfg.pretrain.iterations = 20000
   return cfg

@@ -65,14 +65,14 @@ def default() -> ml_collections.ConfigDict:
           # If true, center the clipping window around the median rather than
           # the mean. More "correct" for removing outliers, but also potentially
           # slow, especially with multihost training.
-          'clip_median': False,
+          'clip_median': True,
           # If true, center the local energy differences in the gradient at the
           # average clipped energy rather than average energy, guaranteeing that
           # the average energy difference will be zero in each batch.
           'center_at_clip': True,
           # If true, keep the parameters and optimizer state from the previous
           # step and revert them if they become NaN after an update.
-          'reset_if_nan': False,
+          'reset_if_nan': True,
           # KFAC hyperparameters. See KFAC documentation for details.
           'kfac': {
               'invert_every': 1,
@@ -224,16 +224,27 @@ def default() -> ml_collections.ConfigDict:
       'debug': {
           # Check optimizer state, parameters and loss and raise an exception if
           # NaN is found.
-          'check_nan': False,
+          'check_nan': True,
           'deterministic': False,  # Use a deterministic seed.
       },
       'pretrain': {
           'method': 'hf',  # Currently only 'hf' is supported.
           'iterations': 20000,  # Only used if method is 'hf'.
-          'basis': 'ccpvdz',  # Larger than STO-6G, but good for excited states
+          'basis': 'sto-6g',
           # Fraction of SCF to use in pretraining MCMC. This enables pretraining
           # similar to the original FermiNet paper.
           'scf_fraction': 1.0,
+          'optimizer': 'lamb',
+          'lr': 3.e-4,
+      },
+      'restart': {
+          # Explicit path to a checkpoint .npz file to restart from. Required.
+          # No auto-discovery — must point to a specific file.
+          # If falsy, restart is disabled.
+          'path': '',
+          # MCMC burn-in steps after reinitializing electrons.
+          # Separate from mcmc.burn_in (which is for fresh starts only).
+          'burn_in': 1000,
       },
   })
 

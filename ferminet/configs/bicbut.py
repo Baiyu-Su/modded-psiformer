@@ -47,4 +47,5 @@ def get_config():
         (1, 0),
         (0, 1),
     )
+  cfg.pretrain.iterations = 20000
   return cfg

@@ -179,6 +179,8 @@ def pretrain_hartree_fock(
     batch_size: int = 0,
     logger: Callable[[int, float], None] | None = None,
     scf_fraction: float = 0.0,
+    optimizer_name: str = 'lamb',
+    pretrain_lr: float = 3.e-4,
 ):
   """Performs training to match initialization as closely as possible to HF.
 
@@ -223,7 +225,12 @@ def pretrain_hartree_fock(
   if is_host_0:
     logging.info('Initializing pretrain optimizer state on %d local devices.',
                  local_device_count)
-  optimizer = optax.adam(3.e-4)
+  if optimizer_name == 'lamb':
+    optimizer = optax.lamb(pretrain_lr)
+  elif optimizer_name == 'adam':
+    optimizer = optax.adam(pretrain_lr)
+  else:
+    raise ValueError(f'Unknown pretrain optimizer: {optimizer_name}')
   opt_state_pt = constants.pmap(optimizer.init)(params)
   if is_host_0:
     logging.info('Pretrain optimizer state initialized.')
@@ -287,6 +294,8 @@ def pretrain_hartree_fock_global(
     batch_size: int = 0,
     logger: Callable[[int, float], None] | None = None,
     scf_fraction: float = 0.0,
+    optimizer_name: str = 'lamb',
+    pretrain_lr: float = 3.e-4,
 ):
   """Runs HF pretraining on a mesh-sharded global walker batch."""
   is_host_0 = jax.process_index() == 0
@@ -325,7 +334,12 @@ def pretrain_hartree_fock_global(
   if is_host_0:
     logging.info('Global charge batches ready.')
 
-  optimizer = optax.adam(3.e-4)
+  if optimizer_name == 'lamb':
+    optimizer = optax.lamb(pretrain_lr)
+  elif optimizer_name == 'adam':
+    optimizer = optax.adam(pretrain_lr)
+  else:
+    raise ValueError(f'Unknown pretrain optimizer: {optimizer_name}')
   opt_state = optimizer.init(params)
   global_params = params
   global_key = key

@@ -15,6 +15,7 @@
 """Main wrapper for FermiNet in JAX."""
 
 import os
+os.environ['NVIDIA_TF32_OVERRIDE'] = '0'
 
 from absl import app
 from absl import flags
