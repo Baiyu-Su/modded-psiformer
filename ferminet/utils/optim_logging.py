@@ -1,4 +1,4 @@
-"""Per-tensor RMS logging utilities for optimizer updates."""
+"""Per-tensor logging utilities for optimizer and parameter statistics."""
 
 from typing import Any, Dict
 
@@ -39,6 +39,21 @@ def compute_per_tensor_rms(
   return rms_dict
 
 
+def compute_per_tensor_param_stats(
+    flat_dict: Dict[str, jnp.ndarray],
+) -> Dict[str, Dict[str, float]]:
+  """Compute RMS, abs min and abs max for each tensor in the flat dict."""
+  stats = {}
+  for name, tensor in flat_dict.items():
+    abs_tensor = jnp.abs(tensor)
+    stats[name] = {
+        'rms': float(jnp.sqrt(jnp.mean(tensor ** 2))),
+        'abs_min': float(jnp.min(abs_tensor)),
+        'abs_max': float(jnp.max(abs_tensor)),
+    }
+  return stats
+
+
 def log_optim_rms_to_wandb(
     precon_grad_tree: Any,
     step: int,
@@ -53,6 +68,22 @@ def log_optim_rms_to_wandb(
   rms = compute_per_tensor_rms(flat)
   wandb_log = {f'optim/{name}': val for name, val in rms.items()}
   wandb_log['step'] = step
+  wandb.log(wandb_log)
+
+
+def log_param_stats_to_wandb(
+    params_tree: Any,
+    step: int,
+) -> None:
+  """Log per-tensor parameter RMS, abs min and abs max to wandb under param/."""
+  first_device_tree = _take_first_device(params_tree)
+  flat = flatten_param_tree_with_names(first_device_tree)
+  stats = compute_per_tensor_param_stats(flat)
+  wandb_log = {'step': step}
+  for name, tensor_stats in stats.items():
+    wandb_log[f'param/{name}/rms'] = tensor_stats['rms']
+    wandb_log[f'param/{name}/abs_min'] = tensor_stats['abs_min']
+    wandb_log[f'param/{name}/abs_max'] = tensor_stats['abs_max']
   wandb.log(wandb_log)
 
 

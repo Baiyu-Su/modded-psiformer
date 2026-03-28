@@ -27,8 +27,8 @@ REQUIRED_PACKAGES = [
     'folx @ git+https://github.com/microsoft/folx',
     # 'jax',
     'jaxlib',
-    # TODO(b/230487443) - use released version of kfac.
-    'kfac_jax @ git+https://github.com/deepmind/kfac-jax',
+    # kfac_jax is included directly in this repo as the top-level kfac_jax
+    # package, so it is picked up by this editable install.
     'ml-collections',
     'optax',
     'numpy',

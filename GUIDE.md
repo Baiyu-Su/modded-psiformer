@@ -6,7 +6,8 @@ This document is for AI agents working on this codebase. It covers what this rep
 
 A modified fork of **FermiNet/PsiFormer** -- JAX-based neural network wavefunctions for solving the many-electron Schrodinger equation via variational Monte Carlo (VMC). The PsiFormer variant uses a transformer (self-attention) ansatz.
 
-Key dependencies: JAX (with GPU/CUDA), kfac_jax (patched), ml_collections, PySCF, optax, wandb.
+Key dependencies: JAX (with GPU/CUDA), kfac_jax (in-repo top-level package),
+ml_collections, PySCF, optax, wandb.
 
 ## Environment Setup
 
@@ -20,24 +21,11 @@ conda activate psiformer
 # 2. Install JAX with GPU support (adjust CUDA version as needed)
 pip install jax[cuda12]
 
-# 3. Install the package in editable mode (pulls most dependencies)
+# 3. Install the package in editable mode
 pip install -e .
-
-# 4. Install kfac_jax from source and apply our patch
-#    The pip install above installs kfac_jax, but we need to overwrite
-#    its internal optimizer.py with our patched version.
-#    Find where kfac_jax is installed, then copy our patch over it:
-KFAC_DIR=$(python -c "import kfac_jax; import os; print(os.path.dirname(kfac_jax.__file__))")
-cp patches/kfac_jax/_src/optimizer.py "${KFAC_DIR}/_src/optimizer.py"
 ```
 
-The patch in `patches/kfac_jax/_src/optimizer.py` fixes multi-host pmap issues in kfac_jax (see the Memory section below for details). This step is **mandatory** -- without it, multi-node training will crash.
-
-To verify the patch is applied:
-```bash
-diff patches/kfac_jax/_src/optimizer.py "$(python -c 'import kfac_jax, os; print(os.path.dirname(kfac_jax.__file__))')/_src/optimizer.py"
-# Should produce no output (files are identical)
-```
+kfac_jax now lives directly in the repo as `kfac_jax/`. Any changes you make there take effect immediately when running from the repo checkout.
 
 ## Running
 
@@ -91,8 +79,8 @@ ferminet/
     writers.py         # CSV/file output writers
     statistics.py      # Statistical analysis of MCMC data
     precision.py       # Precision control utilities
-patches/
-  kfac_jax/_src/optimizer.py   # Patched kfac_jax optimizer for multi-host support
+kfac_jax/
+  _src/                 # In-repo kfac_jax source used by editable install
 train_example.slurm    # Example SLURM submission script
 ```
 
@@ -101,7 +89,8 @@ train_example.slurm    # Example SLURM submission script
 - **Config system**: `ml_collections.ConfigDict`. Override any param on CLI with `--config.path.to.param=value`.
 - **Batchless networks**: Network functions are written without batch dimensions. Batching is handled by `pmap` (across GPUs) + `vmap` (within GPU).
 - **Multi-GPU**: Automatic via JAX `pmap`. Multi-node requires `jax.distributed.initialize()` (already in main.py).
-- **Optimizers**: `kfac` (default, via patched kfac_jax), `adam` (via optax), `none` (inference only).
+- **Optimizers**: `kfac` (default, via in-repo `kfac_jax/`), `adam`
+  (via optax), `none` (inference only).
 - **Style**: Google Python style -- 2-space indent, max 80 char lines.
 - **Logging**: wandb on by default (`cfg.log.use_wandb`). Output goes to `cfg.log.save_path`.
 - **Output files**: `train_stats.csv` (energy, acceptance prob per iteration), `checkpoints/` directory.
@@ -113,7 +102,8 @@ This fork has modifications for multi-node (multi-host) JAX training. Key rules:
 - Use `broadcast_all_local_devices(x[None])` instead of `replicate_all_local_devices(x)` to ensure PmapSharding consistency across hosts.
 - Never index PmapSharding arrays with `array[0]` on non-primary hosts -- use `array[local_pmap_idx]` where `local_pmap_idx = process_index * num_devices`.
 - Only host 0 writes checkpoints, CSV logs, wandb data.
-- The kfac_jax patch fixes `get_first(step_counter)` which would crash non-primary hosts.
+- The in-repo `kfac_jax/` fixes `get_first(step_counter)` which would crash
+  non-primary hosts.
 
 Files modified for multi-host support: `train.py`, `steps.py`, `pretrain.py`, `checkpoint.py`, `utils/writers.py`, `main.py`, `utils/precision.py`.
 

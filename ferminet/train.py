@@ -76,6 +76,7 @@ def init_electrons(  # pylint: disable=dangerous-default-value
     electrons: Sequence[int],
     batch_size: int,
     init_width: float,
+    given_atomic_spin_configs: Sequence[Tuple[int, int]] | None = None,
     max_iter: int = 10_000,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
   """Initializes electron positions around each atom.
@@ -88,6 +89,9 @@ def init_electrons(  # pylint: disable=dangerous-default-value
       devices.
     init_width: width of (atom-centred) Gaussian used to generate initial
       electron configurations.
+    given_atomic_spin_configs: optional per-atom spin assignments to use for
+      initialization when the neutral atomic defaults do not realize the
+      requested global spin partition.
     max_iter: maximum number of iterations to try to find a valid initial
         electron configuration for each atom. If reached, all electrons are
         initialised from a Gaussian distribution centred on the origin.
@@ -101,7 +105,9 @@ def init_electrons(  # pylint: disable=dangerous-default-value
   """
   niter = 0
   total_electrons = sum(atom.charge for atom in molecule)
-  if total_electrons != sum(electrons):
+  if given_atomic_spin_configs is not None:
+    atomic_spin_configs = list(given_atomic_spin_configs)
+  elif total_electrons != sum(electrons):
     if len(molecule) == 1:
       atomic_spin_configs = [electrons]
     else:
@@ -112,15 +118,16 @@ def init_electrons(  # pylint: disable=dangerous-default-value
         (atom.element.nalpha, atom.element.nbeta)
         for atom in molecule
     ]
-    assert sum(sum(x) for x in atomic_spin_configs) == sum(electrons)
-    while (
-        tuple(sum(x) for x in zip(*atomic_spin_configs)) != electrons
-        and niter < max_iter
-    ):
-      i = np.random.randint(len(atomic_spin_configs))
-      nalpha, nbeta = atomic_spin_configs[i]
-      atomic_spin_configs[i] = nbeta, nalpha
-      niter += 1
+
+  assert sum(sum(x) for x in atomic_spin_configs) == sum(electrons)
+  while (
+      tuple(sum(x) for x in zip(*atomic_spin_configs)) != electrons
+      and niter < max_iter
+  ):
+    i = np.random.randint(len(atomic_spin_configs))
+    nalpha, nbeta = atomic_spin_configs[i]
+    atomic_spin_configs[i] = nbeta, nalpha
+    niter += 1
 
   if tuple(sum(x) for x in zip(*atomic_spin_configs)) == electrons:
     electron_positions = []
@@ -345,6 +352,11 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
       cfg.system.electrons,
       batch_size=total_host_batch_size,
       init_width=cfg.mcmc.init_width,
+      given_atomic_spin_configs=(
+          cfg.system.atom_spin_configs
+          if hasattr(cfg.system, 'atom_spin_configs')
+          else None
+      ),
   )
   host_batch_atoms = jnp.tile(atoms[None, ...], [host_batch_size, 1, 1])
   host_batch_charges = jnp.tile(charges[None, ...], [host_batch_size, 1])
@@ -675,6 +687,11 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
       # devices. Use local shard index (not [0]) to avoid accessing
       # a remote shard in multi-host JAX.
       loss = loss[local_pmap_idx]
+      valid_samples = (
+          aux_data.valid_samples[local_pmap_idx]
+          if aux_data.valid_samples is not None
+          else None
+      )
       # per batch variance isn't informative. Use weighted mean and variance
       # instead.
       weighted_stats = statistics.exponentialy_weighted_stats(
@@ -741,12 +758,15 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
               'train/learning_rate': float(current_lr),
               'train/momentum': float(current_mom),
           }
+          if valid_samples is not None:
+            wandb_log['train/valid_samples'] = float(valid_samples)
 
           # Add optimizer norm statistics if available
           if optimizer_stats is not None:
             wandb_log['train/param_norm'] = float(optimizer_stats.param_norm[0])
             wandb_log['train/grad_norm'] = float(optimizer_stats.grad_norm[0])
             wandb_log['train/precon_grad_norm'] = float(optimizer_stats.precon_grad_norm[0])
+            wandb_log['train/fisher_norm'] = float(optimizer_stats.fisher_norm[0])
             wandb_log['train/update_norm'] = float(optimizer_stats.update_norm[0])
 
           wandb.log(wandb_log)
@@ -754,6 +774,7 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
           if optimizer_stats is not None and optimizer_stats.precon_grad_tree is not None:
             optim_logging.log_optim_rms_to_wandb(
                 optimizer_stats.precon_grad_tree, t)
+          optim_logging.log_param_stats_to_wandb(params, t)
 
       # Checkpoint saving (step-based) — only on host 0.
       if is_host_0 and (

@@ -1,0 +1,29 @@
+"""O3 baseline config: no momentum, Fisher-norm clipping, longer LR decay."""
+
+import os
+
+from ferminet.configs import o3
+import ml_collections
+
+
+def get_config() -> ml_collections.ConfigDict:
+  cfg = o3.get_config()
+  run_name = os.environ.get('FERMINET_RUN_NAME', 'o3_A_1_baseline')
+
+  cfg.log.save_path = f'./runs/{run_name}'
+  cfg.log.use_wandb = True
+  cfg.log.wandb.name = run_name
+  cfg.log.wandb.project = 'psiformer'
+  cfg.log.wandb.notes = 'A_1_baseline O3 momentum ablation'
+
+  cfg.mcmc.algorithm = 'mh'
+  cfg.debug.check_nan = False
+  cfg.optim.reset_if_nan = False
+  cfg.optim.kfac.momentum = 0.0
+  cfg.optim.kfac.momentum_warmup_steps = 0
+  cfg.optim.kfac.nesterov = False
+  cfg.optim.kfac.constrain_l2 = False
+  cfg.optim.kfac.norm_constraint = 0.001
+  cfg.optim.lr.rate = 0.05
+  cfg.optim.lr.delay = 3e4
+  return cfg

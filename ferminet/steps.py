@@ -37,6 +37,7 @@ class OptimizerStats:
   param_norm: Optional[jnp.ndarray] = None
   grad_norm: Optional[jnp.ndarray] = None
   precon_grad_norm: Optional[jnp.ndarray] = None
+  fisher_norm: Optional[jnp.ndarray] = None
   update_norm: Optional[jnp.ndarray] = None
   precon_grad_tree: Optional[networks.ParamTree] = None
 
@@ -276,6 +277,7 @@ def make_kfac_training_step(
         param_norm=stats.get('param_norm'),
         grad_norm=stats.get('grad_norm'),
         precon_grad_norm=stats.get('precon_grad_norm'),
+        fisher_norm=stats.get('fisher_norm'),
         update_norm=stats.get('update_norm'),
         precon_grad_tree=stats.get('precon_grad_tree'),
     )

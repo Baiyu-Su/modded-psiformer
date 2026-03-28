@@ -69,8 +69,8 @@ class Optimizer(utils.WithStagedMethods):
     r"""Persistent state of the optimizer.
 
     Attributes:
-      velocities: The update to the parameters from the previous step -
-        :math:`\theta_t - \theta_{t-1}`.
+      velocities: Exponential moving-average momentum buffer of the
+        raw gradients fed into momentum.
       estimator_state: The persistent state for the curvature estimator.
       damping: When using damping adaptation, this will contain the current
         value.
@@ -874,28 +874,22 @@ class Optimizer(utils.WithStagedMethods):
 
   @utils.staged
   def _maybe_apply_norm_constraint_l2(
-      self, preconditioned_grads: Params
-  ) -> tuple[Params, Params | None]:
-    """Scales precon grad to have L2 norm <= norm_constraint.
-
-    This variant ignores the true gradient and uses only the L2 norm of the
-    preconditioned gradient for clipping.
-    """
+      self, grads: Params
+  ) -> Params:
+    """Scales raw grads to have L2 norm <= norm_constraint before momentum."""
 
     if self._norm_constraint is None:
-      return preconditioned_grads, None
+      return grads
 
     assert not self._use_adaptive_learning_rate
 
-    sq_norm = utils.inner_product(preconditioned_grads, preconditioned_grads)
+    sq_norm = utils.inner_product(grads, grads)
     norm = jnp.sqrt(sq_norm)
 
     max_coefficient = self._norm_constraint / norm
     coefficient = jnp.minimum(max_coefficient, 1)
 
-    precon_grad = utils.scalar_mul(preconditioned_grads, coefficient)
-
-    return precon_grad, sq_norm
+    return utils.scalar_mul(grads, coefficient)
 
   @utils.staged
   def compute_loss_from_registrations(
@@ -914,6 +908,30 @@ class Optimizer(utils.WithStagedMethods):
       loss += l2_reg_val
 
     return loss
+
+  @utils.staged
+  def _compute_momentum_buffer_and_direction(
+      self,
+      velocities: Params,
+      grads: Params,
+      momentum: Array,
+  ) -> tuple[Params, Params]:
+    """Computes the raw-gradient EMA momentum buffer and direction."""
+
+    momentum_buffer = self.weighted_sum_of_objects(
+        (velocities, grads),
+        (momentum, 1.0 - momentum),
+    )
+
+    if self._use_nesterov:
+      direction = self.weighted_sum_of_objects(
+          (grads, momentum_buffer),
+          (1.0 - momentum, momentum),
+      )
+    else:
+      direction = momentum_buffer
+
+    return momentum_buffer, direction
 
   @utils.staged
   def _init(
@@ -1116,57 +1134,46 @@ class Optimizer(utils.WithStagedMethods):
     # Update the inverse curvature
     state = self._maybe_update_inverse_cache(state, precon_damping)
 
-    # Compute proposed directions
-    preconditioned_gradient = self._compute_preconditioned_gradient(
-        state, grads, precon_damping
+    # Optionally clip raw gradients before they enter the momentum buffer.
+    if self._constrain_l2:
+      grads_for_momentum = self._maybe_apply_norm_constraint_l2(grads)
+    else:
+      grads_for_momentum = grads
+
+    # Update raw-gradient momentum and build the raw direction to precondition.
+    momentum_buffer, momentum_direction = self._compute_momentum_buffer_and_direction(
+        state.velocities,
+        grads_for_momentum,
+        momentum,
     )
 
-    # constrain the norms
-    if self._constrain_l2:
-      preconditioned_gradient, scaled_grad_norm_sq = (
-          self._maybe_apply_norm_constraint_l2(preconditioned_gradient)
+    # Precondition the momentum direction after the momentum update.
+    preconditioned_gradient = self._compute_preconditioned_gradient(
+        state, momentum_direction, precon_damping
+    )
+    preconditioned_gradient_pre_clip = preconditioned_gradient
+    precon_grad_norm = utils.norm(preconditioned_gradient_pre_clip)
+    fisher_norm_sq = utils.inner_product(preconditioned_gradient_pre_clip,
+                                         momentum_direction)
+    fisher_norm = jnp.sqrt(fisher_norm_sq)
+
+    # Fisher clipping is only applied when using the Fisher-norm mode.
+    if not self._constrain_l2:
+      preconditioned_gradient, _ = self._maybe_apply_norm_constraint(
+          momentum_direction, preconditioned_gradient_pre_clip, learning_rate,
       )
-    else:
-      preconditioned_gradient, scaled_grad_norm_sq = (
-          self._maybe_apply_norm_constraint(
-              grads, preconditioned_gradient, learning_rate,
-          )
-      )
 
-    # Build the parameter update
-    if self._use_nesterov:
-      # Nesterov: delta = mu^2 * v - (1 + mu) * lr * g_precon
-      # and velocity buffer update v <- mu * v - lr * g_precon
-      velocity_candidate = self.weighted_sum_of_objects(
-          (state.velocities, preconditioned_gradient), (momentum, -learning_rate))
-      delta = self.weighted_sum_of_objects(
-          (state.velocities, preconditioned_gradient),
-          (momentum ** 2, -(1.0 + momentum) * learning_rate))
-
-      # Provide dummy coefficients for logging fields
-      coefficients = (-learning_rate, momentum)
-
-      # Use the same quad-model change logic as the original code for damping
-      quad_model_change = self._invalid_metric_value
-    else:
-      vectors = (preconditioned_gradient, state.velocities)
-      coefficients = (-learning_rate, momentum)
-      quad_model_change = self._invalid_metric_value
-
-      # Compute the parameter update (delta)
-      delta = self.weighted_sum_of_objects(vectors, coefficients)
+    delta = utils.scalar_mul(preconditioned_gradient, -learning_rate)
+    quad_model_change = self._invalid_metric_value
 
     # Update parameters
-    new_params = jax.tree_util.tree_map(jnp.add, params, delta)
+    new_params = self.weighted_sum_of_objects((params, delta), (1.0, 1.0))
 
     new_loss, rho = self._invalid_metric_value, self._invalid_metric_value
 
     # stop the linter from complaining about uninitialized variable
     reject_step = False
-    if self._use_nesterov:
-      params, state.velocities = new_params, velocity_candidate
-    else:
-      params, state.velocities = new_params, delta
+    params, state.velocities = new_params, momentum_buffer
 
     # Compute per-device and total batch size
     batch_size = self._batch_size_extractor(func_args[-1])
@@ -1180,24 +1187,20 @@ class Optimizer(utils.WithStagedMethods):
     state.data_seen = state.data_seen + total_batch_size
     state.step_counter = state.step_counter + 1
 
-    # Statistics with useful information
-    # Unlike other norm stats, sq_norm_scaled_grads has to be computed if
-    # norm_constraint is not None, so log it by default even if the other
-    # norm stats are not logged. This reduces the overall computational cost if
-    # no other grad stats are desired.
+    # Statistics with useful information.
     stats = dict(
         step=state.step_counter,
         batch_size=jnp.asarray(total_batch_size, dtype=jnp.int32),
         data_seen=state.data_seen,
         loss=loss,
         new_loss=new_loss,
-        learning_rate=(learning_rate if self._use_nesterov and momentum is not None else -coefficients[0]),
-        momentum=(momentum if self._use_nesterov and momentum is not None else coefficients[1]),
+        learning_rate=learning_rate,
+        momentum=momentum,
         damping=damping,
         precon_damping=precon_damping,
         rho=rho,
         quad_model_change=quad_model_change,
-        scaled_grad_norm_sq=scaled_grad_norm_sq,
+        fisher_norm=fisher_norm,
     )
 
     if self._use_step_rejection:
@@ -1212,14 +1215,15 @@ class Optimizer(utils.WithStagedMethods):
     if self._include_norms_in_stats:
       stats["param_norm"] = utils.norm(params)
       stats["grad_norm"] = utils.norm(grads)
-      stats["precon_grad_norm"] = utils.norm(preconditioned_gradient)
+      stats["precon_grad_norm"] = precon_grad_norm
       stats["update_norm"] = utils.norm(delta)
 
     if self._include_per_param_norms_in_stats:
       stats.update(utils.per_parameter_norm(params, "param_norm"))
       stats.update(utils.per_parameter_norm(grads, "grad_norm"))
       stats.update(
-          utils.per_parameter_norm(preconditioned_gradient, "precon_grad_norm")
+          utils.per_parameter_norm(
+              preconditioned_gradient_pre_clip, "precon_grad_norm")
       )
       stats.update(utils.per_parameter_norm(delta, "update_norm"))
 

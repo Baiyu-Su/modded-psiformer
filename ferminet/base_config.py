@@ -57,7 +57,7 @@ def default() -> ml_collections.ConfigDict:
           'lr': {
               'rate': 0.05,  # learning rate
               'decay': 1.0,  # exponent of learning rate decay
-              'delay': 100000.0,  # term that sets the scale of the rate decay
+              'delay': 10000.0,  # term that sets the scale of the rate decay
           },
           # If greater than zero, scale (at which to clip local energy) in units
           # of the mean deviation from the mean.
@@ -79,7 +79,7 @@ def default() -> ml_collections.ConfigDict:
               'cov_update_every': 1,
               'damping': 0.001,
               'cov_ema_decay': 0.95,
-              'momentum': 0.0,
+              'momentum': 0.9,
               'nesterov': False,
               # Number of steps for linear warmup of momentum from 0 to final value
               'momentum_warmup_steps': 20000,
@@ -103,7 +103,7 @@ def default() -> ml_collections.ConfigDict:
       },
       'log': {
           'stats_frequency': 100,  # iterations between logging of stats
-          'save_frequency': 4000,  # steps between saving network params
+          'save_frequency': 40000,  # steps between saving network params
           # Path to save network to. If falsy, creates a timestamped directory
           # in the working directory.
           'save_path': '',
@@ -132,7 +132,7 @@ def default() -> ml_collections.ConfigDict:
           # If 0, evaluation is disabled. Otherwise run every `interval` steps.
           'interval': 20000,
           # Number of evaluation iterations (MCMC + loss eval) per eval event.
-          'iterations': 2000,
+          'iterations': 4000,
       },
       'system': {
           'type': SystemType.MOLECULE.value,

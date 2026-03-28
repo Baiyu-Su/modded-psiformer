@@ -44,6 +44,8 @@ class AuxiliaryLossData:
   local_energy: jax.Array
   clipped_energy: jax.Array
   grad_local_energy: jax.Array | None = None
+  outlier_mask: jax.Array | None = None
+  valid_samples: jax.Array | None = None
 
 
 class LossFn(Protocol):
@@ -175,6 +177,15 @@ def make_loss(network: networks.LogFermiNetLike,
   )
   batch_network = vmap(network, in_axes=(None, 0, 0, 0, 0), out_axes=0)
 
+  def masked_sum_and_count(
+      value: jnp.ndarray,
+      mask: jnp.ndarray,
+  ) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Computes masked value and mask sums over the global batch."""
+    value_sum = constants.psum(jnp.sum(value * mask))
+    mask_sum = constants.psum(jnp.sum(mask))
+    return value_sum, mask_sum
+
   @jax.custom_jvp
   def total_energy(
       params: networks.ParamTree,
@@ -200,14 +211,23 @@ def make_loss(network: networks.LogFermiNetLike,
     """
     keys = jax.random.split(key, num=data.positions.shape[0])
     e_l = batch_local_energy(params, keys, data)
-    loss = constants.pmean(jnp.mean(e_l))
-    loss_diff = e_l - loss
-    variance = constants.pmean(jnp.mean(loss_diff ** 2))
+    is_finite = jnp.isfinite(e_l)
+    mask = is_finite.astype(e_l.dtype)
+    e_l = jnp.nan_to_num(e_l)
+    energy_sum, valid_samples = masked_sum_and_count(e_l, mask)
+    valid_samples = jnp.maximum(
+        valid_samples, jnp.asarray(1.0, dtype=energy_sum.dtype)
+    )
+    loss = energy_sum / valid_samples
+    variance_sum, _ = masked_sum_and_count((e_l - loss) ** 2, mask)
+    variance = variance_sum / valid_samples
     return loss, AuxiliaryLossData(
         energy=loss,
         variance=variance,
         local_energy=e_l,
         clipped_energy=e_l,
+        outlier_mask=mask,
+        valid_samples=valid_samples,
     )
 
   @total_energy.defjvp
@@ -223,8 +243,18 @@ def make_loss(network: networks.LogFermiNetLike,
           clip_local_energy,
           clip_from_median,
           center_at_clipped_energy)
+      if aux_data.outlier_mask is not None:
+        diff = diff * aux_data.outlier_mask
+        device_batch_size = jnp.maximum(
+            jnp.sum(aux_data.outlier_mask),
+            jnp.asarray(1.0, dtype=diff.dtype),
+        )
+      else:
+        device_batch_size = jnp.shape(aux_data.local_energy)[0]
     else:
       diff = aux_data.local_energy - loss
+      if aux_data.outlier_mask is not None:
+        diff = diff * aux_data.outlier_mask
 
     # Due to the simultaneous requirements of KFAC (calling convention must be
     # (params, rng, data)) and Laplacian calculation (only want to take
@@ -243,7 +273,8 @@ def make_loss(network: networks.LogFermiNetLike,
     psi_primal, psi_tangent = jax.jvp(batch_network, primals, tangents)
     kfac_jax.register_normal_predictive_distribution(psi_primal[:, None])
     primals_out = loss, aux_data
-    device_batch_size = jnp.shape(aux_data.local_energy)[0]
+    if clip_local_energy <= 0.0:
+      device_batch_size = jnp.shape(aux_data.local_energy)[0]
     tangents_out = (jnp.dot(psi_tangent, diff) / device_batch_size, aux_data)
     return primals_out, tangents_out
 
